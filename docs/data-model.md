@@ -9,6 +9,15 @@
 
 ```mermaid
 erDiagram
+    Account {
+        UUID id PK
+        String name
+        AccountType type
+        String currency
+        Decimal openingBalance
+        Bool isArchived
+        Int sortOrder
+    }
     Expense {
         UUID id PK
         String name
@@ -17,8 +26,8 @@ erDiagram
         ExpenseType type
         Date date
         String note
-        String paymentMethod
         String tags
+        String attachments
     }
     Category {
         UUID id PK
@@ -40,6 +49,16 @@ erDiagram
         Date lastUpdated
         String note
     }
+    InvestmentTransaction {
+        UUID id PK
+        InvestmentTxType type
+        Decimal quantity
+        Decimal price
+        Decimal fee
+        String currency
+        Date date
+        String note
+    }
     Platform {
         UUID id PK
         String name
@@ -57,7 +76,11 @@ erDiagram
         Date date
         Date dueDate
         Decimal interest
+        Bool isInstallment
+        Int installmentCount
+        Decimal perPeriodAmount
         String note
+        String attachments
     }
     Counterparty {
         UUID id PK
@@ -80,11 +103,20 @@ erDiagram
     }
 
     Expense }o--|| Category : "belongsTo"
+    Expense }o--|| Account : "postsTo"
+    Expense }o--o| Account : "transferTo"
     Holding }o--|| Platform : "belongsTo"
+    Holding ||--o{ InvestmentTransaction : "has"
+    InvestmentTransaction }o--o| Account : "fundedBy"
     Debt }o--|| Counterparty : "belongsTo"
     Debt ||--o{ Repayment : "has"
+    Repayment }o--o| Account : "paidVia"
     Holding ||--o{ PriceSnapshot : "history"
 ```
+
+> 与 v0.1 初稿相比新增：`Account`（统一账户）、`InvestmentTransaction`（投资交易流水）；
+> `Expense` 由关联 `Account` 取代原 `paymentMethod` 字符串，并支持转账（`transferTo`）；
+> `Debt` 增加分期字段；`Expense`/`Debt` 支持图片凭证（`attachments`）。
 
 ---
 
@@ -95,6 +127,31 @@ erDiagram
 |----|------|
 | `.income` | 收入 |
 | `.expense` | 支出（默认） |
+| `.transfer` | 转账（账户间调拨，**不计入收支统计**） |
+
+### AccountType
+| 值 | 说明 | 示例 |
+|----|------|------|
+| `.cash` | 现金 | 钱包现金 |
+| `.wallet` | 第三方钱包 | 微信、支付宝 |
+| `.bank` | 银行卡（借记） | 招行储蓄卡 |
+| `.creditCard` | 信用卡 | 余额为负代表欠款 |
+| `.broker` | 证券账户 | 富途、老虎 |
+| `.exchange` | 加密交易所 | 币安、欧易 |
+| `.fund` | 基金账户 | 支付宝基金 |
+| `.other` | 其他 | - |
+
+### InvestmentTxType
+| 值 | 说明 | 对数量/成本影响 |
+|----|------|----------------|
+| `.buy` | 买入 | 增加数量，计入成本 |
+| `.sell` | 卖出 | 减少数量，结转已实现盈亏 |
+| `.dividend` | 分红 | 不变（现金分红）/ 可选降成本 |
+| `.airdrop` | 空投 | 增加数量，成本计 0 |
+| `.transferIn` | 转入 | 增加数量，按转入时价记成本 |
+| `.transferOut` | 转出 | 减少数量 |
+| `.fee` | 手续费 | 计入成本 / 现金流出 |
+| `.interest` | 利息 | 现金流入 |
 
 ### AssetClass
 | 值 | 说明 | 示例 |
@@ -135,11 +192,20 @@ erDiagram
 | `category` | `Category` | 非空，级联 | 关联分类 |
 | `date` | `Date` | 非空，默认当前时间 | 发生时间 |
 | `note` | `String?` | 可空，≤200字符 | 备注 |
-| `paymentMethod` | `String?` | 可空 | 支付方式（现金/微信/支付宝/银行卡/信用卡/其他） |
+| `account` | `Account` | 非空，级联 | 出账/入账账户（取代原 `paymentMethod` 字符串） |
+| `transferToAccount` | `Account?` | 仅 `type == .transfer` 时非空 | 转入账户（双腿转账的收款腿） |
 | `tags` | `[String]` | 可空，JSON存储 | 自由标签 |
+| `attachments` | `[String]` | 可空，本地文件引用 | 图片凭证（收据/截图） |
 | `createdAt` | `Date` | 自动设置 | 创建时间（用于排序一致性） |
 
-**关联**：`category` → `Category`（多对一）
+**关联**：
+- `category` → `Category`（多对一）
+- `account` → `Account`（多对一，资金流出/流入的账户）
+- `transferToAccount` → `Account`（多对一，转账收款腿）
+
+**转账语义**：`type == .transfer` 时，`account` 为转出账户、`transferToAccount`
+为转入账户，金额从前者流出、流入后者；该记录**不计入收入/支出统计**，仅影响两端
+账户余额。
 
 ---
 
@@ -169,8 +235,8 @@ erDiagram
 | `name` | `String` | 非空，≤50字符 | 标的名称（如"比特币"） |
 | `assetClass` | `AssetClass` | 非空 | 资产类别 |
 | `platform` | `Platform` | 非空，级联 | 所属平台 |
-| `quantity` | `Decimal` | 非空，> 0 | 持仓数量 |
-| `costPrice` | `Decimal` | 非空，> 0 | 成本价（每单位） |
+| `quantity` | `Decimal` | 非空，≥ 0 | 持仓数量（由 `InvestmentTransaction` 按移动加权平均推导缓存） |
+| `costPrice` | `Decimal` | 非空，≥ 0 | 持仓均价（同上推导；无交易历史时允许手动初始化） |
 | `currentPrice` | `Decimal?` | 可空 | 现价（手动录入或API更新） |
 | `currency` | `String` | 非空，默认 `"USD"` | 计价币种 |
 | `lastUpdated` | `Date?` | 可空 | 价格最后更新时间 |
@@ -179,13 +245,19 @@ erDiagram
 
 **计算属性**（不存数据库）：
 - `marketValue` = `currentPrice * quantity`（当前市值）
-- `costValue` = `costPrice * quantity`（成本总额）
-- `gainLoss` = `marketValue - costValue`（浮动盈亏）
-- `gainLossPercent` = `gainLoss / costValue * 100`（收益率%）
+- `costValue` = `costPrice * quantity`（持仓成本总额）
+- `unrealizedGain` = `marketValue - costValue`（**未实现**浮动盈亏）
+- `realizedGain` = Σ卖出交易 `(成交价 − 当时均价) × 卖出量 − 手续费`（**已实现**盈亏）
+- `gainLossPercent` = `unrealizedGain / costValue * 100`（持仓收益率%）
 - `isPriceStale` = `lastUpdated < Date.now - 3600s`（价格是否过期）
+
+> **成本推导规则**：每笔 `InvestmentTransaction` 按时间顺序回放，买入/转入累加数量与
+> 成本（移动加权平均），卖出/转出按当时均价扣减并结转 `realizedGain`，空投按 0 成本入账。
+> `Holding.quantity/costPrice` 为该回放结果的缓存值。
 
 **关联**：
 - `platform` → `Platform`（多对一）
+- `transactions` → `[InvestmentTransaction]`（一对多，按 date 排序）
 - `priceHistory` → `[PriceSnapshot]`（一对多）
 
 ---
@@ -219,13 +291,18 @@ erDiagram
 | `currency` | `String` | 非空，默认 `"CNY"` | 币种 |
 | `status` | `DebtStatus` | 非空，默认 `.open` | 结算状态（自动计算） |
 | `date` | `Date` | 非空，默认当前时间 | 发生日期 |
-| `dueDate` | `Date?` | 可空 | 到期日 |
+| `dueDate` | `Date?` | 可空 | 到期日（分期时为首期到期日） |
 | `interest` | `Decimal?` | 可空，≥0，单位% | 年化利率（0=免息） |
+| `isInstallment` | `Bool` | 非空，默认 `false` | 是否分期（花呗/信用卡分期/房贷/车贷） |
+| `installmentCount` | `Int?` | `isInstallment` 时非空，>0 | 总期数 |
+| `perPeriodAmount` | `Decimal?` | `isInstallment` 时非空，>0 | 每期金额 |
 | `note` | `String?` | 可空，≤300字符 | 备注 |
+| `attachments` | `[String]` | 可空，本地文件引用 | 凭证（借条/合同截图） |
 
 **计算属性**：
 - `remainingAmount` = `amount - settledAmount`（剩余未还金额）
 - `isOverdue` = `dueDate != nil && dueDate < Date.now && status != .settled`（是否已逾期）
+- `nextDueDate` = 分期时按 `dueDate` + 已还期数推算的下一期到期日
 
 **关联**：
 - `counterparty` → `Counterparty`（多对一）
@@ -259,9 +336,11 @@ erDiagram
 | `debt` | `Debt` | 非空，级联 | 关联借贷 |
 | `amount` | `Decimal` | 非空，> 0 | 本次还款金额 |
 | `date` | `Date` | 非空，默认当前时间 | 还款日期 |
+| `account` | `Account?` | 可空 | 还款方式（关联账户，影响账户余额） |
 | `note` | `String?` | 可空，≤200字符 | 备注 |
 
-**触发逻辑**：新增 Repayment 后，自动更新 `Debt.settledAmount` 并重新计算 `Debt.status`。
+**触发逻辑**：新增 Repayment 后，自动更新 `Debt.settledAmount` 并重新计算 `Debt.status`；
+若指定 `account`，则该笔还款同时计入账户余额变动（我欠→流出，外债收款→流入）。
 
 ---
 
@@ -279,7 +358,89 @@ erDiagram
 
 ---
 
+### 3.9 Account（统一账户）
+
+承载用户的资金账户，是"日常账本余额"进入净资产的载体。日常流水、投资出资、
+借贷还款都可关联到账户。
+
+| 字段名 | 类型 | 约束 | 说明 |
+|--------|------|------|------|
+| `id` | `UUID` | PK | 唯一标识 |
+| `name` | `String` | 非空，≤30字符 | 账户名称（如"招行储蓄卡"、"微信零钱"） |
+| `type` | `AccountType` | 非空 | 账户类型 |
+| `currency` | `String` | 非空，默认 `"CNY"` | 账户币种 |
+| `openingBalance` | `Decimal` | 非空，默认 0 | 期初余额（信用卡可为负=欠款） |
+| `isArchived` | `Bool` | 非空，默认 `false` | 是否归档（不在记账选择中显示） |
+| `sortOrder` | `Int` | 非空，默认递增 | 显示顺序 |
+| `note` | `String?` | 可空 | 备注 |
+| `createdAt` | `Date` | 自动设置 | 创建时间 |
+
+**计算属性**（不存数据库，由流水推导）：
+- `currentBalance` = `openingBalance + Σ流入 − Σ流出`
+  - 收入 Expense 流入、支出 Expense 流出
+  - 转账：转出账户流出、转入账户流入
+  - 关联了 `account` 的 Repayment / 投资出资计入相应方向
+- `balanceInBaseCurrency` = `currentBalance × 汇率(currency → 基础货币)`
+
+**关联**：`expenses` / `transfersIn` → `[Expense]`、`repayments` → `[Repayment]`（反向）
+
+**预置账户**（首启 onboarding 引导录入期初余额）：现金、微信、支付宝、银行卡。
+
+---
+
+### 3.10 InvestmentTransaction（投资交易流水）
+
+记录某持仓的每一笔交易，是还原成本、计算已实现盈亏、绘制建仓历史的基础。
+
+| 字段名 | 类型 | 约束 | 说明 |
+|--------|------|------|------|
+| `id` | `UUID` | PK | 唯一标识 |
+| `holding` | `Holding` | 非空，级联 | 关联持仓 |
+| `type` | `InvestmentTxType` | 非空 | 交易类型（买/卖/分红/空投/转入/转出/手续费/利息） |
+| `quantity` | `Decimal` | 非空，≥ 0 | 交易数量（分红/利息可为 0） |
+| `price` | `Decimal` | 非空，≥ 0 | 成交价格（每单位） |
+| `fee` | `Decimal` | 非空，默认 0 | 手续费 |
+| `currency` | `String` | 非空 | 成交币种 |
+| `date` | `Date` | 非空，默认当前时间 | 交易时间 |
+| `fundingAccount` | `Account?` | 可空 | 出资/收款账户（买入扣现金、卖出/分红入现金） |
+| `note` | `String?` | 可空，≤200字符 | 备注 |
+
+**触发逻辑**：新增/编辑/删除交易后，回放该持仓全部交易，重算
+`Holding.quantity / costPrice / realizedGain`；若指定 `fundingAccount`，
+对应现金流计入账户余额。
+
+**关联**：`holding` → `Holding`（多对一）、`fundingAccount` → `Account`（多对一）
+
+---
+
 ## 四、聚合查询设计
+
+### 4.0 净资产总览（总览页）
+
+```
+净资产 = 账户余额合计 + 投资市值合计 + 应收合计 − 应付合计
+其中：
+  账户余额合计 = SUM(account.currentBalance 换算基础货币)   ← 含现金/银行/钱包，信用卡为负
+  投资市值合计 = SUM(holding.marketValue 换算基础货币)
+  应收合计     = SUM(debt.remainingAmount) WHERE direction == .owedToMe && status != .settled
+  应付合计     = SUM(debt.remainingAmount) WHERE direction == .iOwe     && status != .settled
+```
+
+> 修正说明：v0.1 初稿净资产仅为"投资市值 − 借贷净额"，**漏掉了账户现金余额**。
+> 引入 `Account` 后，现金/银行存款进入净资产，口径与"个人资产负债表"一致。
+
+**账户当前余额**（账户列表/账户维度统计）：
+
+```
+currentBalance(account) = account.openingBalance
+  + SUM(expense.amount) WHERE expense.account == account && type == .income
+  − SUM(expense.amount) WHERE expense.account == account && type == .expense
+  − SUM(expense.amount) WHERE expense.account == account && type == .transfer      （转出腿）
+  + SUM(expense.amount) WHERE expense.transferToAccount == account && type == .transfer （转入腿）
+  ± 关联了 account 的 Repayment / InvestmentTransaction 现金流
+```
+
+---
 
 ### 4.1 日常账本统计
 
@@ -287,8 +448,9 @@ erDiagram
 
 ```
 目标：给定 startDate 和 endDate，汇总 totalIncome, totalExpense, netBalance
-Predicate：expense.date >= startDate && expense.date < endDate
+Predicate：expense.date >= startDate && expense.date < endDate && type != .transfer
 聚合：对 expense 按 type 分组，对 amount 求和
+注意：type == .transfer 的记录一律排除，避免账户间调拨污染收支统计
 ```
 
 **按分类汇总**（分类占比饼图）：
@@ -322,8 +484,16 @@ percent = delta / previousTotal * 100
 **按平台分组**：
 
 ```
-目标：按 platform 分组，计算每个平台的 totalMarketValue, totalCostValue, gainLoss
+目标：按 platform 分组，计算每个平台的 totalMarketValue, totalCostValue,
+      unrealizedGain（持仓浮盈）, realizedGain（已实现，来自卖出交易）
 所有持仓 currentPrice 换算为基础货币（CNY）后再汇总
+```
+
+**风险集中度**（投资总览提醒）：
+
+```
+concentration(holding) = holding.marketValue / totalMarketValue
+当任一持仓 concentration > 0.5 时，提示"单一资产占比过高，注意集中度风险"
 ```
 
 **总市值趋势**（折线图）：
@@ -358,8 +528,10 @@ SELECT * FROM Debt WHERE dueDate BETWEEN now AND now+3days AND status != .settle
 | 操作 | 级联行为 |
 |------|---------|
 | 删除 Category | 若有关联 Expense，拒绝删除（或改为"其他"） |
+| 删除 Account | 若有关联 Expense/Repayment/投资出资，拒绝删除（改为归档 `isArchived`） |
 | 删除 Platform | 若有关联 Holding，拒绝删除 |
-| 删除 Holding | 级联删除所有 PriceSnapshot |
+| 删除 Holding | 级联删除所有 PriceSnapshot 与 InvestmentTransaction |
+| 删除 InvestmentTransaction | 回放剩余交易，重算 Holding 数量/成本/已实现盈亏 |
 | 删除 Debt | 级联删除所有 Repayment |
 | 删除 Counterparty | 仅当无未结清 Debt 时允许删除 |
 
